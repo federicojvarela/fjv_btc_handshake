@@ -37,35 +37,53 @@ fn setup() -> anyhow::Result<Args> {
     Ok(args)
 }
 
-async fn start(args: Args) -> anyhow::Result<()> {
-    tracing::info!("Resolving DNS seed: {}:{}", args.dns_seed, args.port);
-    let resolved_addresses: Vec<_> = lookup_host((args.dns_seed, args.port)).await?.collect();
+async fn resolve_dns_seed(dns_seed: &str, port: u16) -> anyhow::Result<Vec<SocketAddr>> {
+    tracing::info!("Resolving DNS seed: {}:{}", dns_seed, port);
+    let resolved_addresses = lookup_host((dns_seed, port)).await
+        .map_err(|e| anyhow::anyhow!("Failed to resolve DNS seed '{}:{}': {}", dns_seed, port, e))?
+        .collect();
+    Ok(resolved_addresses)
+}
+// Function to perform handshakes with a list of resolved addresses
+async fn perform_handshakes(
+    resolved_addresses: Vec<SocketAddr>,
+    args: &Args,
+) -> anyhow::Result<()> {
+    // Map each address to a handshake attempt with a timeout
+    let handshakes = resolved_addresses
+        .into_iter()
+        .map(|address| tokio::time::timeout(args.timeout, handshake(&args.network.0, address)));
 
-    let mut succeeded = 0;
-    let mut failed = 0;
+    // Await all handshake attempts and collect results
+    let results = join_all(handshakes).await;
 
-    for result in join_all(
-        resolved_addresses
-            .into_iter()
-            .map(|address| tokio::time::timeout(args.timeout, handshake(&args.network.0, address))),
-    )
-    .await
-    .into_iter()
-    {
+    // Count the number of succeeded and failed handshakes
+    let (succeeded, failed) = results.into_iter().fold((0, 0), |(succ, fail), result| {
         match result {
-            Ok(Ok(_)) => succeeded += 1,
+            Ok(Ok(_)) => (succ + 1, fail), // Increment success count if handshake succeeded
             Ok(Err(e)) => {
-                failed += 1;
-                tracing::warn!("{}", e)
-            }
+                tracing::warn!("Handshake error: {}", e); // Log warning if handshake failed
+                (succ, fail + 1) // Increment failure count
+            },
             Err(e) => {
-                failed += 1;
-                tracing::warn!("{}", e)
+                tracing::warn!("Timeout error: {}", e); // Log warning if handshake timed out
+                (succ, fail + 1) // Increment failure count
             }
         }
-    }
-    tracing::info!("finished with {} SUCCESS & {} FAILED", succeeded, failed);
+    });
 
+    // Log the final results of all handshakes
+    tracing::info!(
+        "Handshake results: {} succeeded, {} failed",
+        succeeded,
+        failed
+    );
+    Ok(())
+}
+
+async fn start(args: Args) -> anyhow::Result<()> {
+    let resolved_addresses = resolve_dns_seed(&args.dns_seed, args.port).await?;
+    perform_handshakes(resolved_addresses, &args).await?;
     Ok(())
 }
 
