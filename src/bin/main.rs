@@ -38,12 +38,21 @@ fn setup() -> anyhow::Result<Args> {
 }
 
 async fn resolve_dns_seed(dns_seed: &str, port: u16) -> anyhow::Result<Vec<SocketAddr>> {
+    // Log the action of resolving the DNS seed with the specified port
     tracing::info!("Resolving DNS seed: {}:{}", dns_seed, port);
+
+    // Perform the DNS lookup asynchronously, handling errors with a custom message
     let resolved_addresses = lookup_host((dns_seed, port)).await
-        .map_err(|e| anyhow::anyhow!("Failed to resolve DNS seed '{}:{}': {}", dns_seed, port, e))?
-        .collect();
+        .map_err(|e| {
+            // If an error occurs, return a detailed error using anyhow's anyhow! macro
+            anyhow::anyhow!("Failed to resolve DNS seed '{}:{}': {}", dns_seed, port, e)
+        })?
+        .collect(); // Collect the results into a vector of SocketAddr
+
+    // Return the resolved addresses if successful
     Ok(resolved_addresses)
 }
+
 // Function to perform handshakes with a list of resolved addresses
 async fn perform_handshakes(
     resolved_addresses: Vec<SocketAddr>,
@@ -64,7 +73,7 @@ async fn perform_handshakes(
             Ok(Err(e)) => {
                 tracing::warn!("Handshake error: {}", e); // Log warning if handshake failed
                 (succ, fail + 1) // Increment failure count
-            },
+            }
             Err(e) => {
                 tracing::warn!("Timeout error: {}", e); // Log warning if handshake timed out
                 (succ, fail + 1) // Increment failure count
@@ -93,18 +102,45 @@ async fn handshake(network: &Network, address: SocketAddr) -> anyhow::Result<()>
     verack_exchange(network, &mut stream).await
 }
 
-#[tracing::instrument(name = "version", skip(stream))]
+#[tracing::instrument(name = "version_exchange", skip(stream))]
 async fn version_exchange(
     network: &Network,
     address: SocketAddr,
     stream: &mut TcpStream,
 ) -> anyhow::Result<()> {
+    // Construct the version message to send
+    let version_message = create_version_message(network, PROTOCOL_VERSION as u32, address, stream)?;
+    let serialized_message = version_message.serialize()?;
+
+    // Send the serialized version message
+    stream.write_all(&serialized_message).await?;
+    tracing::trace!("Sent {} bytes", serialized_message.len());
+
+    // Receive and process the response
+    let mut reader = BufReader::new(stream);
+    let mut buffer = reader.fill_buf().await?;
+    let received_length = buffer.len();
+    tracing::trace!("Received {} bytes", received_length);
+
+    let received_version = Message::<Version>::deserialize(&mut buffer, network)?;
+
+    // Check for nonce conflict
+    check_nonce_conflict(&version_message, &received_version)?;
+
+    // Compare received version with the current version
+    compare_versions(&version_message, &received_version)?;
+
+    // Consume the buffer after processing
+    reader.consume(received_length);
+
+    Ok(())
+}
+
+fn create_version_message(network: &Network, protocol_version: u32, address: SocketAddr, stream: &TcpStream) -> anyhow::Result<Message<Version>> {
     let version = Version::new(
-        PROTOCOL_VERSION,
+        protocol_version as i32,
         Services::NODE_NETWORK,
-        SystemTime::now()
-            .duration_since(SystemTime::UNIX_EPOCH)?
-            .as_secs() as i64,
+        SystemTime::now().duration_since(SystemTime::UNIX_EPOCH)?.as_secs() as i64,
         address,
         stream.local_addr()?,
         rand::random(),
@@ -112,32 +148,26 @@ async fn version_exchange(
         0,
         false,
     )?;
-    let sent_version = Message::new(network, version);
-    let frame = sent_version.serialize()?;
+    Ok(Message::new(network, version))
+}
 
-    stream.write_all(&frame).await?;
-    tracing::trace!("Sent {} bytes", frame.len());
-
-    let mut reader = BufReader::new(stream);
-    let mut received_bytes = reader.fill_buf().await?;
-    let received_n = received_bytes.len();
-
-    tracing::trace!("Received {} bytes", received_bytes.len());
-
-    let received_version = Message::<Version>::deserialize(&mut received_bytes, network)?;
-
+fn check_nonce_conflict(sent_version: &Message<Version>, received_version: &Message<Version>) -> anyhow::Result<()> {
     if sent_version.payload.nonce == received_version.payload.nonce {
+        // Err(anyhow::anyhow!("Nonce conflict detected"))
         Err(HandshakeError::NonceConflict)?
+    } else {
+        Ok(())
     }
+}
 
+fn compare_versions(sent_version: &Message<Version>, received_version: &Message<Version>) -> anyhow::Result<()> {
     if sent_version.payload.version > received_version.payload.version {
-        tracing::warn!("received version ({}) which is lower than the currently implemented one ({}) trying to proceed",
-            sent_version.payload.version,
-            received_version.payload.version);
+        tracing::warn!(
+            "Received version ({}) is lower than the currently implemented one ({})",
+            received_version.payload.version,
+            sent_version.payload.version
+        );
     }
-
-    reader.consume(received_n);
-
     Ok(())
 }
 
